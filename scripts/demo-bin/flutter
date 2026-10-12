@@ -1,0 +1,6 @@
+#!/bin/bash
+# README demo: looks like a Go build (prints progress, uses one CPU core).
+yes >/dev/null & trap 'kill $(jobs -p) 2>/dev/null' EXIT
+for p in internal/auth internal/billing internal/catalog internal/orders internal/stock internal/reporting internal/server cmd/api cmd/worker; do
+  for i in 1 2 3 4; do echo "compile github.com/acme/api/$p ($i/4)"; sleep 1.5; done
+done

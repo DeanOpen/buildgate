@@ -1,0 +1,5 @@
+#!/bin/bash
+yes >/dev/null & trap 'kill $(jobs -p) 2>/dev/null' EXIT
+echo; echo "> acme-web@2.3.0 build /Users/Shared/Projects/acme-web"; echo "> tsc -b && vite build"; echo
+echo "vite v6.3.5 building for production..."
+n=0; for f in routes/dashboard routes/orders routes/products components/table components/chart lib/api; do for i in 1 2 3 4 5; do n=$((n+137)); echo "transforming ($n) src/$f/index.tsx"; sleep 1.2; done; done
