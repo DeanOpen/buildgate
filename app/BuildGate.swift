@@ -877,17 +877,20 @@ struct MenuLabel: View {
 struct PanelView: View {
     @EnvironmentObject var model: Model
     @Environment(\.openWindow) private var openWindow
+    @State private var size = CGSize.zero
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 8) {
-                AppLogo(size: 24)
-                Text("BuildGate").font(.headline)
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 10) {
+                AppLogo(size: 32)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("BuildGate").font(.headline)
+                    Text(summary).font(.caption).foregroundStyle(.secondary)
+                }
                 Spacer()
                 Toggle("", isOn: $model.config.enabled).toggleStyle(.switch).labelsHidden().controlSize(.small)
             }
-            Text(summary).font(.caption).foregroundStyle(.secondary)
-            HStack(spacing: 14) {
+            HStack(spacing: 16) {
                 Meter(title: "CPU", value: model.system.cpu,
                       detail: "\(Int((model.system.cpu * 100).rounded()))%")
                 Meter(title: "Memory", value: Double(model.system.memUsed) / Double(max(model.system.memTotal, 1)),
@@ -897,53 +900,125 @@ struct PanelView: View {
                       detail: formatBytes(model.system.swapUsed))
                     .help("Swap used \(formatBytes(model.system.swapUsed)) of \(formatBytes(model.system.swapTotal)) (macOS grows swap as needed)")
             }
+            .padding(12)
+            .panelSection()
 
-            Divider()
             if model.rows.isEmpty && model.waitingRows.isEmpty {
-                Text("No builds running").foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .center).padding(.vertical, 8)
+                Label("No builds running", systemImage: "checkmark.circle")
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity).padding(.vertical, 14)
+                    .panelSection()
             }
-            if !model.rows.isEmpty {
-                Text("Running").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                ForEach(model.rows) { BuildRow(row: $0) }
-            }
-            if !model.waitingRows.isEmpty {
-                Text("Waiting").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                ForEach(model.waitingRows) { BuildRow(row: $0) }
-            }
+            if !model.rows.isEmpty { section("Running", model.rows) }
+            if !model.waitingRows.isEmpty { section("Waiting", model.waitingRows) }
             if !model.killed.isEmpty {
-                Text("Killed for going over the limit").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                ForEach(model.killed.prefix(5)) { k in
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(k.command).font(.system(.callout, design: .monospaced)).lineLimit(1).truncationMode(.tail)
-                        Text("\(k.cwd.replacingOccurrences(of: NSHomeDirectory(), with: "~")) · \(k.at.formatted(date: .omitted, time: .shortened))")
-                            .font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                VStack(alignment: .leading, spacing: 6) {
+                    SectionTitle(text: "Killed for going over the limit")
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(model.killed.prefix(5)) { k in
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(k.command).font(.system(.callout, design: .monospaced)).lineLimit(1).truncationMode(.tail)
+                                Text("\(k.cwd.replacingOccurrences(of: NSHomeDirectory(), with: "~")) · \(k.at.formatted(date: .omitted, time: .shortened))")
+                                    .font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
                     }
+                    .padding(10)
+                    .panelSection()
                 }
             }
-            Divider()
-            HStack {
-                Button("Settings…") {
+
+            HStack(spacing: 8) {
+                Button {
                     openWindow(id: "settings")
                     NSApp.activate(ignoringOtherApps: true)
-                }
-                Button("Logs") {
+                } label: { Label("Settings…", systemImage: "gearshape") }
+                Button {
                     if model.selectedLog == nil { model.selectedLog = model.logs.first?.id }
                     openWindow(id: "logs")
                     NSApp.activate(ignoringOtherApps: true)
-                }
+                } label: { Label("Logs", systemImage: "doc.text") }
                 Spacer()
-                Button("Quit") { NSApp.terminate(nil) }
+                Button { NSApp.terminate(nil) } label: { Label("Quit", systemImage: "power") }
             }
+            .panelButtons()
         }
-        .padding(14)
+        .padding(16)
         .frame(width: 440)
+        .fixedSize(horizontal: false, vertical: true)
+        .onGeometryChange(for: CGSize.self) { $0.size } action: { size = $0 }
+        .panelGlass()
+        .background(PanelWindowFit(size: size))
+    }
+
+    func section(_ title: String, _ rows: [Row]) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            SectionTitle(text: title)
+            VStack(spacing: 0) {
+                ForEach(Array(rows.enumerated()), id: \.element.id) { i, r in
+                    if i > 0 { Divider().padding(.horizontal, 10) }
+                    BuildRow(row: r).padding(.horizontal, 10).padding(.vertical, 8)
+                }
+            }
+            .panelSection()
+        }
     }
 
     var summary: String {
         guard model.config.enabled else { return "Off: builds are not limited" }
         let mode = model.config.whenFull == "wait" ? "extra builds wait" : "extra builds are rejected"
         return "\(model.rows.count) of \(model.config.maxBuilds) builds running, \(mode)"
+    }
+}
+
+struct SectionTitle: View {
+    let text: String
+    var body: some View {
+        Text(text).font(.caption.weight(.semibold)).foregroundStyle(.secondary).padding(.leading, 4)
+    }
+}
+
+extension View {
+    /// A rounded, slightly lighter group inside the panel.
+    func panelSection() -> some View {
+        background(.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+
+    /// Liquid Glass on macOS 26+; the system panel background before that.
+    @ViewBuilder func panelGlass() -> some View {
+        if #available(macOS 26, *) {
+            containerBackground(.clear, for: .window)
+                .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        } else {
+            self
+        }
+    }
+
+    @ViewBuilder func panelButtons() -> some View {
+        if #available(macOS 26, *) {
+            buttonStyle(.glass).controlSize(.large)
+        } else {
+            buttonStyle(.bordered).controlSize(.large)
+        }
+    }
+}
+
+/// Keeps the menu bar window the size of the panel, top edge fixed: SwiftUI's
+/// MenuBarExtra window grows with its content but does not shrink back, which
+/// left the panel floating in the middle of a too-tall window.
+struct PanelWindowFit: NSViewRepresentable {
+    let size: CGSize
+    func makeNSView(context: Context) -> NSView { NSView() }
+    func updateNSView(_ v: NSView, context: Context) {
+        DispatchQueue.main.async {
+            guard let w = v.window, size.height > 0, !w.styleMask.contains(.titled) else { return }
+            var f = w.frame
+            guard abs(f.height - size.height) > 0.5 else { return }
+            f.origin.y += f.height - size.height
+            f.size.height = size.height
+            w.setFrame(f, display: true)
+        }
     }
 }
 
@@ -995,7 +1070,7 @@ struct Meter: View {
                         .frame(width: g.size.width * min(max(value, 0), 1))
                 }
             }
-            .frame(height: 5)
+            .frame(height: 6)
         }
         .frame(maxWidth: .infinity)
     }
@@ -1028,20 +1103,22 @@ struct BuildRow: View {
             }
             .frame(minWidth: 64, alignment: .trailing)
             let logID = model.logID(for: row)
-            Button {
-                model.selectedLog = logID
-                openWindow(id: "logs")
-                NSApp.activate(ignoringOtherApps: true)
-            } label: {
-                Image(systemName: "doc.text.magnifyingglass").font(.title3)
+            HStack(spacing: 4) {
+                Button {
+                    model.selectedLog = logID
+                    openWindow(id: "logs")
+                    NSApp.activate(ignoringOtherApps: true)
+                } label: {
+                    Image(systemName: "doc.text.magnifyingglass").frame(width: 26, height: 26).contentShape(Rectangle())
+                }
+                .disabled(logID == nil)
+                .help(logID == nil ? "Started outside BuildGate or in a terminal: output is not captured" : "Show live output")
+                Button { model.stop(row.pid) } label: {
+                    Image(systemName: "xmark.circle.fill").foregroundStyle(.red).frame(width: 26, height: 26).contentShape(Rectangle())
+                }
+                .help("Kill this build and everything it started")
             }
-            .buttonStyle(.borderless)
-            .disabled(logID == nil)
-            .help(logID == nil ? "Started outside BuildGate or in a terminal: output is not captured" : "Show live output")
-            Button { model.stop(row.pid) } label: {
-                Image(systemName: "xmark.circle.fill").font(.title3)
-            }
-            .buttonStyle(.borderless).foregroundStyle(.red).help("Kill this build and everything it started")
+            .buttonStyle(.borderless).font(.system(size: 16))
         }
     }
 }
