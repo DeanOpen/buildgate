@@ -142,7 +142,8 @@ buildgate setup [id|all]  set up shells and agents
 
 ## Build from source
 
-Requires macOS 14+, Xcode command line tools and Go.
+Requires macOS 14+, Xcode command line tools and Go. Xcode 26 or newer adds
+the Liquid Glass look on macOS 26+; older Xcode builds without it.
 
 ```sh
 ./build-dmg.sh                 # dist/BuildGate.app + dist/BuildGate-1.0.dmg (universal)

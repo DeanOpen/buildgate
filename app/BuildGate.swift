@@ -986,21 +986,30 @@ extension View {
     }
 
     /// Liquid Glass on macOS 26+; the system panel background before that.
+    /// (Needs the macOS 26 SDK, Xcode 26; older Xcode builds without it.)
     @ViewBuilder func panelGlass() -> some View {
+        #if compiler(>=6.2)
         if #available(macOS 26, *) {
             containerBackground(.clear, for: .window)
                 .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
         } else {
             self
         }
+        #else
+        self
+        #endif
     }
 
     @ViewBuilder func panelButtons() -> some View {
+        #if compiler(>=6.2)
         if #available(macOS 26, *) {
             buttonStyle(.glass).controlSize(.large)
         } else {
             buttonStyle(.bordered).controlSize(.large)
         }
+        #else
+        buttonStyle(.bordered).controlSize(.large)
+        #endif
     }
 }
 
