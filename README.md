@@ -36,7 +36,7 @@ or waits for a free slot if you prefer.
   and `TOO MANY BUILDS AT THE SAME TIME`, or waits in line.
 - **Watchdog:** builds that skip the limit (old shells, IDEs, `./gradlew`) are
   noticed, and the newest ones over the limit are stopped.
-- **Live view:** CPU, memory and swap, plus each build's CPU and memory, with a
+- **Live view:** CPU, memory, swap, CPU temperature and network speed, plus each build's CPU and memory, with a
   ✕ to stop it and its live log.
 - **Made for AI agents:** Claude Code and Codex get hooks that tell the agent
   *"BuildGate rejected this, it is not a compile error or out-of-memory: wait

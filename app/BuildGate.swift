@@ -175,6 +175,18 @@ func formatBytes(_ b: UInt64) -> String {
     ByteCountFormatter.string(fromByteCount: Int64(b), countStyle: .memory)
 }
 
+func formatRate(_ bytesPerSecond: UInt64) -> String {
+    let f = ByteCountFormatter()
+    f.countStyle = .decimal
+    f.allowsNonnumericFormatting = false  // "0 KB/s", not "Zero KB/s"
+    return f.string(fromByteCount: Int64(bytesPerSecond)) + "/s"
+}
+
+/// 0...1 on a log scale from 1 KB/s to 1 GB/s, for the network bars.
+func rateLevel(_ bytesPerSecond: UInt64) -> Double {
+    bytesPerSecond < 1000 ? 0 : (log10(Double(bytesPerSecond)) - 3) / 6
+}
+
 struct Killed: Identifiable {
     let id = UUID()
     let at: Date
@@ -436,10 +448,15 @@ struct SystemStats {
     var memTotal: UInt64 = ProcessInfo.processInfo.physicalMemory
     var swapUsed: UInt64 = 0
     var swapTotal: UInt64 = 0
+    var cpuTemp: Double?  // °C, hottest CPU die sensor; nil where unknown (Intel)
+    var netIn: UInt64 = 0  // bytes per second, Wi-Fi and Ethernet
+    var netOut: UInt64 = 0
 }
 
 final class SystemSampler {
     private var prev: (busy: UInt64, total: UInt64)?
+    private var prevNet: (rx: UInt64, tx: UInt64, at: TimeInterval)?
+    private let temps = TempSensors()
 
     func sample() -> SystemStats {
         var out = SystemStats()
@@ -477,7 +494,90 @@ final class SystemSampler {
             out.swapUsed = swap.xsu_used
             out.swapTotal = swap.xsu_total
         }
+        out.cpuTemp = temps.cpu()
+        let net = networkBytes(), now = ProcessInfo.processInfo.systemUptime
+        if let p = prevNet, now > p.at, net.rx >= p.rx, net.tx >= p.tx {
+            out.netIn = UInt64(Double(net.rx - p.rx) / (now - p.at))
+            out.netOut = UInt64(Double(net.tx - p.tx) / (now - p.at))
+        }
+        prevNet = (net.rx, net.tx, now)
         return out
+    }
+}
+
+/// Bytes received and sent so far on the Wi-Fi and Ethernet interfaces (en*),
+/// with 64-bit counters. VPN tunnels and loopback are left out so traffic is
+/// not counted twice.
+func networkBytes() -> (rx: UInt64, tx: UInt64) {
+    var mib: [Int32] = [CTL_NET, PF_ROUTE, 0, 0, NET_RT_IFLIST2, 0]
+    var len = 0
+    guard sysctl(&mib, 6, nil, &len, nil, 0) == 0 else { return (0, 0) }
+    var buf = [UInt8](repeating: 0, count: len)
+    guard sysctl(&mib, 6, &buf, &len, nil, 0) == 0 else { return (0, 0) }
+    var rx: UInt64 = 0, tx: UInt64 = 0, i = 0
+    var name = [CChar](repeating: 0, count: Int(IF_NAMESIZE))
+    buf.withUnsafeBytes { p in
+        while i + MemoryLayout<if_msghdr>.size <= len {
+            let h = p.loadUnaligned(fromByteOffset: i, as: if_msghdr.self)
+            if Int32(h.ifm_type) == RTM_IFINFO2, i + MemoryLayout<if_msghdr2>.size <= len {
+                let m = p.loadUnaligned(fromByteOffset: i, as: if_msghdr2.self)
+                if if_indextoname(UInt32(m.ifm_index), &name) != nil, String(cString: name).hasPrefix("en") {
+                    rx += m.ifm_data.ifi_ibytes
+                    tx += m.ifm_data.ifi_obytes
+                }
+            }
+            guard h.ifm_msglen > 0 else { break }
+            i += Int(h.ifm_msglen)
+        }
+    }
+    return (rx, tx)
+}
+
+/// Apple silicon temperature sensors, read through IOKit's HID event system
+/// (there is no public API for them; system monitor apps use the same). Looked up
+/// with dlsym so a missing symbol only hides the temperature.
+final class TempSensors {
+    private typealias CopyEvent = @convention(c) (AnyObject, Int64, Int32, Int64) -> Unmanaged<AnyObject>?
+    private typealias GetFloat = @convention(c) (AnyObject, Int32) -> Double
+    private var client: AnyObject?  // owns the services below
+    private var dies: [AnyObject] = []
+    private var copyEvent: CopyEvent?
+    private var getFloat: GetFloat?
+
+    init() {
+        typealias Create = @convention(c) (CFAllocator?) -> Unmanaged<AnyObject>?
+        typealias SetMatching = @convention(c) (AnyObject, CFDictionary) -> Int32
+        typealias CopyServices = @convention(c) (AnyObject) -> Unmanaged<CFArray>?
+        typealias CopyProperty = @convention(c) (AnyObject, CFString) -> Unmanaged<AnyObject>?
+        guard let io = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW),
+              let create = dlsym(io, "IOHIDEventSystemClientCreate"),
+              let setMatching = dlsym(io, "IOHIDEventSystemClientSetMatching"),
+              let copyServices = dlsym(io, "IOHIDEventSystemClientCopyServices"),
+              let copyProperty = dlsym(io, "IOHIDServiceClientCopyProperty"),
+              let event = dlsym(io, "IOHIDServiceClientCopyEvent"),
+              let float = dlsym(io, "IOHIDEventGetFloatValue"),
+              let client = unsafeBitCast(create, to: Create.self)(kCFAllocatorDefault)?.takeRetainedValue()
+        else { return }
+        self.client = client
+        // Apple vendor page 0xff00, usage 5: temperature sensors.
+        _ = unsafeBitCast(setMatching, to: SetMatching.self)(client, ["PrimaryUsagePage": 0xff00, "PrimaryUsage": 5] as CFDictionary)
+        let services = unsafeBitCast(copyServices, to: CopyServices.self)(client)?.takeRetainedValue() as? [AnyObject] ?? []
+        let product = unsafeBitCast(copyProperty, to: CopyProperty.self)
+        // "PMU tdie1", "PMU2 tdie3", ...: the CPU dies.
+        dies = services.filter { (product($0, "Product" as CFString)?.takeRetainedValue() as? String)?.contains("tdie") == true }
+        copyEvent = unsafeBitCast(event, to: CopyEvent.self)
+        getFloat = unsafeBitCast(float, to: GetFloat.self)
+    }
+
+    func cpu() -> Double? {
+        guard let copyEvent, let getFloat else { return nil }
+        let kIOHIDEventTypeTemperature: Int64 = 15
+        let values = dies.compactMap { s -> Double? in
+            guard let e = copyEvent(s, kIOHIDEventTypeTemperature, 0, 0)?.takeRetainedValue() else { return nil }
+            let c = getFloat(e, Int32(kIOHIDEventTypeTemperature << 16))
+            return c > 0 && c < 150 ? c : nil
+        }
+        return values.max()
     }
 }
 
@@ -877,73 +977,160 @@ struct MenuLabel: View {
 struct PanelView: View {
     @EnvironmentObject var model: Model
     @Environment(\.openWindow) private var openWindow
+    @State private var size = CGSize.zero
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 8) {
-                AppLogo(size: 24)
-                Text("BuildGate").font(.headline)
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 10) {
+                AppLogo(size: 32)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("BuildGate").font(.headline)
+                    Text(summary).font(.caption).foregroundStyle(.secondary)
+                }
                 Spacer()
                 Toggle("", isOn: $model.config.enabled).toggleStyle(.switch).labelsHidden().controlSize(.small)
             }
-            Text(summary).font(.caption).foregroundStyle(.secondary)
-            HStack(spacing: 14) {
-                Meter(title: "CPU", value: model.system.cpu,
-                      detail: "\(Int((model.system.cpu * 100).rounded()))%")
-                Meter(title: "Memory", value: Double(model.system.memUsed) / Double(max(model.system.memTotal, 1)),
-                      detail: String(format: "%.1f / %.0f GB", Double(model.system.memUsed) / 1_073_741_824,
-                                     Double(model.system.memTotal) / 1_073_741_824))
-                Meter(title: "Swap", value: model.system.swapTotal > 0 ? Double(model.system.swapUsed) / Double(model.system.swapTotal) : 0,
-                      detail: formatBytes(model.system.swapUsed))
-                    .help("Swap used \(formatBytes(model.system.swapUsed)) of \(formatBytes(model.system.swapTotal)) (macOS grows swap as needed)")
+            Grid(horizontalSpacing: 16, verticalSpacing: 12) {
+                GridRow {
+                    Meter(title: "CPU", value: model.system.cpu,
+                          detail: "\(Int((model.system.cpu * 100).rounded()))%")
+                    Meter(title: "Memory", value: Double(model.system.memUsed) / Double(max(model.system.memTotal, 1)),
+                          detail: String(format: "%.1f / %.0f GB", Double(model.system.memUsed) / 1_073_741_824,
+                                         Double(model.system.memTotal) / 1_073_741_824))
+                    Meter(title: "Swap", value: model.system.swapTotal > 0 ? Double(model.system.swapUsed) / Double(model.system.swapTotal) : 0,
+                          detail: formatBytes(model.system.swapUsed))
+                        .help("Swap used \(formatBytes(model.system.swapUsed)) of \(formatBytes(model.system.swapTotal)) (macOS grows swap as needed)")
+                }
+                GridRow {
+                    if let t = model.system.cpuTemp {
+                        Meter(title: "Temp", value: t / 100, detail: "\(Int(t.rounded()))°C")
+                            .help("Hottest CPU die sensor")
+                    }
+                    Meter(title: "↓ Down", value: rateLevel(model.system.netIn), detail: formatRate(model.system.netIn), tint: .accentColor)
+                        .help("Received on Wi-Fi and Ethernet")
+                    Meter(title: "↑ Up", value: rateLevel(model.system.netOut), detail: formatRate(model.system.netOut), tint: .accentColor)
+                        .help("Sent on Wi-Fi and Ethernet")
+                }
+            }
+            .padding(12)
+            .panelSection()
+
+            if model.rows.isEmpty && model.waitingRows.isEmpty {
+                Label("No builds running", systemImage: "checkmark.circle")
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity).padding(.vertical, 14)
+                    .panelSection()
+            }
+            if !model.rows.isEmpty { section("Running", model.rows) }
+            if !model.waitingRows.isEmpty { section("Waiting", model.waitingRows) }
+            if !model.killed.isEmpty {
+                VStack(alignment: .leading, spacing: 6) {
+                    SectionTitle(text: "Killed for going over the limit")
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(model.killed.prefix(5)) { k in
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(k.command).font(.system(.callout, design: .monospaced)).lineLimit(1).truncationMode(.tail)
+                                Text("\(k.cwd.replacingOccurrences(of: NSHomeDirectory(), with: "~")) · \(k.at.formatted(date: .omitted, time: .shortened))")
+                                    .font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+                    .padding(10)
+                    .panelSection()
+                }
             }
 
-            Divider()
-            if model.rows.isEmpty && model.waitingRows.isEmpty {
-                Text("No builds running").foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .center).padding(.vertical, 8)
-            }
-            if !model.rows.isEmpty {
-                Text("Running").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                ForEach(model.rows) { BuildRow(row: $0) }
-            }
-            if !model.waitingRows.isEmpty {
-                Text("Waiting").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                ForEach(model.waitingRows) { BuildRow(row: $0) }
-            }
-            if !model.killed.isEmpty {
-                Text("Killed for going over the limit").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                ForEach(model.killed.prefix(5)) { k in
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(k.command).font(.system(.callout, design: .monospaced)).lineLimit(1).truncationMode(.tail)
-                        Text("\(k.cwd.replacingOccurrences(of: NSHomeDirectory(), with: "~")) · \(k.at.formatted(date: .omitted, time: .shortened))")
-                            .font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
-                    }
-                }
-            }
-            Divider()
-            HStack {
-                Button("Settings…") {
+            HStack(spacing: 8) {
+                Button {
                     openWindow(id: "settings")
                     NSApp.activate(ignoringOtherApps: true)
-                }
-                Button("Logs") {
+                } label: { Label("Settings…", systemImage: "gearshape") }
+                Button {
                     if model.selectedLog == nil { model.selectedLog = model.logs.first?.id }
                     openWindow(id: "logs")
                     NSApp.activate(ignoringOtherApps: true)
-                }
+                } label: { Label("Logs", systemImage: "doc.text") }
                 Spacer()
-                Button("Quit") { NSApp.terminate(nil) }
+                Button { NSApp.terminate(nil) } label: { Label("Quit", systemImage: "power") }
             }
+            .panelButtons()
         }
-        .padding(14)
+        .padding(16)
         .frame(width: 440)
+        .fixedSize(horizontal: false, vertical: true)
+        .onGeometryChange(for: CGSize.self) { $0.size } action: { size = $0 }
+        .panelGlass()
+        .background(PanelWindowFit(size: size))
+    }
+
+    func section(_ title: String, _ rows: [Row]) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            SectionTitle(text: title)
+            VStack(spacing: 0) {
+                ForEach(Array(rows.enumerated()), id: \.element.id) { i, r in
+                    if i > 0 { Divider().padding(.horizontal, 10) }
+                    BuildRow(row: r).padding(.horizontal, 10).padding(.vertical, 8)
+                }
+            }
+            .panelSection()
+        }
     }
 
     var summary: String {
         guard model.config.enabled else { return "Off: builds are not limited" }
         let mode = model.config.whenFull == "wait" ? "extra builds wait" : "extra builds are rejected"
         return "\(model.rows.count) of \(model.config.maxBuilds) builds running, \(mode)"
+    }
+}
+
+struct SectionTitle: View {
+    let text: String
+    var body: some View {
+        Text(text).font(.caption.weight(.semibold)).foregroundStyle(.secondary).padding(.leading, 4)
+    }
+}
+
+extension View {
+    /// A rounded, slightly lighter group inside the panel.
+    func panelSection() -> some View {
+        background(.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+
+    /// Liquid Glass on macOS 26+; the system panel background before that.
+    @ViewBuilder func panelGlass() -> some View {
+        if #available(macOS 26, *) {
+            containerBackground(.clear, for: .window)
+                .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        } else {
+            self
+        }
+    }
+
+    @ViewBuilder func panelButtons() -> some View {
+        if #available(macOS 26, *) {
+            buttonStyle(.glass).controlSize(.large)
+        } else {
+            buttonStyle(.bordered).controlSize(.large)
+        }
+    }
+}
+
+/// Keeps the menu bar window the size of the panel, top edge fixed: SwiftUI's
+/// MenuBarExtra window grows with its content but does not shrink back, which
+/// left the panel floating in the middle of a too-tall window.
+struct PanelWindowFit: NSViewRepresentable {
+    let size: CGSize
+    func makeNSView(context: Context) -> NSView { NSView() }
+    func updateNSView(_ v: NSView, context: Context) {
+        DispatchQueue.main.async {
+            guard let w = v.window, size.height > 0, !w.styleMask.contains(.titled) else { return }
+            var f = w.frame
+            guard abs(f.height - size.height) > 0.5 else { return }
+            f.origin.y += f.height - size.height
+            f.size.height = size.height
+            w.setFrame(f, display: true)
+        }
     }
 }
 
@@ -980,6 +1167,7 @@ struct Meter: View {
     let title: String
     let value: Double
     let detail: String
+    var tint: Color?  // fixed color instead of turning orange/red when high
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
@@ -991,11 +1179,11 @@ struct Meter: View {
             GeometryReader { g in
                 ZStack(alignment: .leading) {
                     Capsule().fill(.quaternary)
-                    Capsule().fill(value > 0.85 ? Color.red : value > 0.65 ? Color.orange : Color.accentColor)
+                    Capsule().fill(tint ?? (value > 0.85 ? Color.red : value > 0.65 ? Color.orange : Color.accentColor))
                         .frame(width: g.size.width * min(max(value, 0), 1))
                 }
             }
-            .frame(height: 5)
+            .frame(height: 6)
         }
         .frame(maxWidth: .infinity)
     }
@@ -1028,20 +1216,22 @@ struct BuildRow: View {
             }
             .frame(minWidth: 64, alignment: .trailing)
             let logID = model.logID(for: row)
-            Button {
-                model.selectedLog = logID
-                openWindow(id: "logs")
-                NSApp.activate(ignoringOtherApps: true)
-            } label: {
-                Image(systemName: "doc.text.magnifyingglass").font(.title3)
+            HStack(spacing: 4) {
+                Button {
+                    model.selectedLog = logID
+                    openWindow(id: "logs")
+                    NSApp.activate(ignoringOtherApps: true)
+                } label: {
+                    Image(systemName: "doc.text.magnifyingglass").frame(width: 26, height: 26).contentShape(Rectangle())
+                }
+                .disabled(logID == nil)
+                .help(logID == nil ? "Started outside BuildGate or in a terminal: output is not captured" : "Show live output")
+                Button { model.stop(row.pid) } label: {
+                    Image(systemName: "xmark.circle.fill").foregroundStyle(.red).frame(width: 26, height: 26).contentShape(Rectangle())
+                }
+                .help("Kill this build and everything it started")
             }
-            .buttonStyle(.borderless)
-            .disabled(logID == nil)
-            .help(logID == nil ? "Started outside BuildGate or in a terminal: output is not captured" : "Show live output")
-            Button { model.stop(row.pid) } label: {
-                Image(systemName: "xmark.circle.fill").font(.title3)
-            }
-            .buttonStyle(.borderless).foregroundStyle(.red).help("Kill this build and everything it started")
+            .buttonStyle(.borderless).font(.system(size: 16))
         }
     }
 }
