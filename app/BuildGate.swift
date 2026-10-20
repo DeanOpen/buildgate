@@ -175,6 +175,18 @@ func formatBytes(_ b: UInt64) -> String {
     ByteCountFormatter.string(fromByteCount: Int64(b), countStyle: .memory)
 }
 
+func formatRate(_ bytesPerSecond: UInt64) -> String {
+    let f = ByteCountFormatter()
+    f.countStyle = .decimal
+    f.allowsNonnumericFormatting = false  // "0 KB/s", not "Zero KB/s"
+    return f.string(fromByteCount: Int64(bytesPerSecond)) + "/s"
+}
+
+/// 0...1 on a log scale from 1 KB/s to 1 GB/s, for the network bars.
+func rateLevel(_ bytesPerSecond: UInt64) -> Double {
+    bytesPerSecond < 1000 ? 0 : (log10(Double(bytesPerSecond)) - 3) / 6
+}
+
 struct Killed: Identifiable {
     let id = UUID()
     let at: Date
@@ -436,10 +448,15 @@ struct SystemStats {
     var memTotal: UInt64 = ProcessInfo.processInfo.physicalMemory
     var swapUsed: UInt64 = 0
     var swapTotal: UInt64 = 0
+    var cpuTemp: Double?  // °C, hottest CPU die sensor; nil where unknown (Intel)
+    var netIn: UInt64 = 0  // bytes per second, Wi-Fi and Ethernet
+    var netOut: UInt64 = 0
 }
 
 final class SystemSampler {
     private var prev: (busy: UInt64, total: UInt64)?
+    private var prevNet: (rx: UInt64, tx: UInt64, at: TimeInterval)?
+    private let temps = TempSensors()
 
     func sample() -> SystemStats {
         var out = SystemStats()
@@ -477,7 +494,90 @@ final class SystemSampler {
             out.swapUsed = swap.xsu_used
             out.swapTotal = swap.xsu_total
         }
+        out.cpuTemp = temps.cpu()
+        let net = networkBytes(), now = ProcessInfo.processInfo.systemUptime
+        if let p = prevNet, now > p.at, net.rx >= p.rx, net.tx >= p.tx {
+            out.netIn = UInt64(Double(net.rx - p.rx) / (now - p.at))
+            out.netOut = UInt64(Double(net.tx - p.tx) / (now - p.at))
+        }
+        prevNet = (net.rx, net.tx, now)
         return out
+    }
+}
+
+/// Bytes received and sent so far on the Wi-Fi and Ethernet interfaces (en*),
+/// with 64-bit counters. VPN tunnels and loopback are left out so traffic is
+/// not counted twice.
+func networkBytes() -> (rx: UInt64, tx: UInt64) {
+    var mib: [Int32] = [CTL_NET, PF_ROUTE, 0, 0, NET_RT_IFLIST2, 0]
+    var len = 0
+    guard sysctl(&mib, 6, nil, &len, nil, 0) == 0 else { return (0, 0) }
+    var buf = [UInt8](repeating: 0, count: len)
+    guard sysctl(&mib, 6, &buf, &len, nil, 0) == 0 else { return (0, 0) }
+    var rx: UInt64 = 0, tx: UInt64 = 0, i = 0
+    var name = [CChar](repeating: 0, count: Int(IF_NAMESIZE))
+    buf.withUnsafeBytes { p in
+        while i + MemoryLayout<if_msghdr>.size <= len {
+            let h = p.loadUnaligned(fromByteOffset: i, as: if_msghdr.self)
+            if Int32(h.ifm_type) == RTM_IFINFO2, i + MemoryLayout<if_msghdr2>.size <= len {
+                let m = p.loadUnaligned(fromByteOffset: i, as: if_msghdr2.self)
+                if if_indextoname(UInt32(m.ifm_index), &name) != nil, String(cString: name).hasPrefix("en") {
+                    rx += m.ifm_data.ifi_ibytes
+                    tx += m.ifm_data.ifi_obytes
+                }
+            }
+            guard h.ifm_msglen > 0 else { break }
+            i += Int(h.ifm_msglen)
+        }
+    }
+    return (rx, tx)
+}
+
+/// Apple silicon temperature sensors, read through IOKit's HID event system
+/// (there is no public API for them; system monitor apps use the same). Looked up
+/// with dlsym so a missing symbol only hides the temperature.
+final class TempSensors {
+    private typealias CopyEvent = @convention(c) (AnyObject, Int64, Int32, Int64) -> Unmanaged<AnyObject>?
+    private typealias GetFloat = @convention(c) (AnyObject, Int32) -> Double
+    private var client: AnyObject?  // owns the services below
+    private var dies: [AnyObject] = []
+    private var copyEvent: CopyEvent?
+    private var getFloat: GetFloat?
+
+    init() {
+        typealias Create = @convention(c) (CFAllocator?) -> Unmanaged<AnyObject>?
+        typealias SetMatching = @convention(c) (AnyObject, CFDictionary) -> Int32
+        typealias CopyServices = @convention(c) (AnyObject) -> Unmanaged<CFArray>?
+        typealias CopyProperty = @convention(c) (AnyObject, CFString) -> Unmanaged<AnyObject>?
+        guard let io = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW),
+              let create = dlsym(io, "IOHIDEventSystemClientCreate"),
+              let setMatching = dlsym(io, "IOHIDEventSystemClientSetMatching"),
+              let copyServices = dlsym(io, "IOHIDEventSystemClientCopyServices"),
+              let copyProperty = dlsym(io, "IOHIDServiceClientCopyProperty"),
+              let event = dlsym(io, "IOHIDServiceClientCopyEvent"),
+              let float = dlsym(io, "IOHIDEventGetFloatValue"),
+              let client = unsafeBitCast(create, to: Create.self)(kCFAllocatorDefault)?.takeRetainedValue()
+        else { return }
+        self.client = client
+        // Apple vendor page 0xff00, usage 5: temperature sensors.
+        _ = unsafeBitCast(setMatching, to: SetMatching.self)(client, ["PrimaryUsagePage": 0xff00, "PrimaryUsage": 5] as CFDictionary)
+        let services = unsafeBitCast(copyServices, to: CopyServices.self)(client)?.takeRetainedValue() as? [AnyObject] ?? []
+        let product = unsafeBitCast(copyProperty, to: CopyProperty.self)
+        // "PMU tdie1", "PMU2 tdie3", ...: the CPU dies.
+        dies = services.filter { (product($0, "Product" as CFString)?.takeRetainedValue() as? String)?.contains("tdie") == true }
+        copyEvent = unsafeBitCast(event, to: CopyEvent.self)
+        getFloat = unsafeBitCast(float, to: GetFloat.self)
+    }
+
+    func cpu() -> Double? {
+        guard let copyEvent, let getFloat else { return nil }
+        let kIOHIDEventTypeTemperature: Int64 = 15
+        let values = dies.compactMap { s -> Double? in
+            guard let e = copyEvent(s, kIOHIDEventTypeTemperature, 0, 0)?.takeRetainedValue() else { return nil }
+            let c = getFloat(e, Int32(kIOHIDEventTypeTemperature << 16))
+            return c > 0 && c < 150 ? c : nil
+        }
+        return values.max()
     }
 }
 
@@ -890,15 +990,27 @@ struct PanelView: View {
                 Spacer()
                 Toggle("", isOn: $model.config.enabled).toggleStyle(.switch).labelsHidden().controlSize(.small)
             }
-            HStack(spacing: 16) {
-                Meter(title: "CPU", value: model.system.cpu,
-                      detail: "\(Int((model.system.cpu * 100).rounded()))%")
-                Meter(title: "Memory", value: Double(model.system.memUsed) / Double(max(model.system.memTotal, 1)),
-                      detail: String(format: "%.1f / %.0f GB", Double(model.system.memUsed) / 1_073_741_824,
-                                     Double(model.system.memTotal) / 1_073_741_824))
-                Meter(title: "Swap", value: model.system.swapTotal > 0 ? Double(model.system.swapUsed) / Double(model.system.swapTotal) : 0,
-                      detail: formatBytes(model.system.swapUsed))
-                    .help("Swap used \(formatBytes(model.system.swapUsed)) of \(formatBytes(model.system.swapTotal)) (macOS grows swap as needed)")
+            Grid(horizontalSpacing: 16, verticalSpacing: 12) {
+                GridRow {
+                    Meter(title: "CPU", value: model.system.cpu,
+                          detail: "\(Int((model.system.cpu * 100).rounded()))%")
+                    Meter(title: "Memory", value: Double(model.system.memUsed) / Double(max(model.system.memTotal, 1)),
+                          detail: String(format: "%.1f / %.0f GB", Double(model.system.memUsed) / 1_073_741_824,
+                                         Double(model.system.memTotal) / 1_073_741_824))
+                    Meter(title: "Swap", value: model.system.swapTotal > 0 ? Double(model.system.swapUsed) / Double(model.system.swapTotal) : 0,
+                          detail: formatBytes(model.system.swapUsed))
+                        .help("Swap used \(formatBytes(model.system.swapUsed)) of \(formatBytes(model.system.swapTotal)) (macOS grows swap as needed)")
+                }
+                GridRow {
+                    if let t = model.system.cpuTemp {
+                        Meter(title: "Temp", value: t / 100, detail: "\(Int(t.rounded()))°C")
+                            .help("Hottest CPU die sensor")
+                    }
+                    Meter(title: "↓ Down", value: rateLevel(model.system.netIn), detail: formatRate(model.system.netIn), tint: .accentColor)
+                        .help("Received on Wi-Fi and Ethernet")
+                    Meter(title: "↑ Up", value: rateLevel(model.system.netOut), detail: formatRate(model.system.netOut), tint: .accentColor)
+                        .help("Sent on Wi-Fi and Ethernet")
+                }
             }
             .padding(12)
             .panelSection()
@@ -1055,6 +1167,7 @@ struct Meter: View {
     let title: String
     let value: Double
     let detail: String
+    var tint: Color?  // fixed color instead of turning orange/red when high
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
@@ -1066,7 +1179,7 @@ struct Meter: View {
             GeometryReader { g in
                 ZStack(alignment: .leading) {
                     Capsule().fill(.quaternary)
-                    Capsule().fill(value > 0.85 ? Color.red : value > 0.65 ? Color.orange : Color.accentColor)
+                    Capsule().fill(tint ?? (value > 0.85 ? Color.red : value > 0.65 ? Color.orange : Color.accentColor))
                         .frame(width: g.size.width * min(max(value, 0), 1))
                 }
             }
